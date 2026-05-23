@@ -501,9 +501,9 @@ def test_terminal_model_printer_shows_runtime_progress_without_suppressing_final
     printer.finish()
 
     output = stream.getvalue()
-    assert "model> thinking" in output
-    assert "model> requested read_file" in output
-    assert "tool> read_file" in output
+    assert "◆ pico thinking" in output
+    assert "◆ pico requests read_file" in output
+    assert "└─ read_file" in output
     assert printer.printed is True
     assert printer.text_printed is False
 

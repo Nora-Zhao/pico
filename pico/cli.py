@@ -151,24 +151,24 @@ class TerminalModelPrinter:
             self.reset_model_output()
             attempts = event.get("attempts")
             tool_steps = event.get("tool_steps")
-            self._write(f"model> thinking (attempt {attempts}, tools {tool_steps})\n", is_model_text=False)
+            self._write(f"◆ pico thinking · attempt {attempts} · tools {tool_steps}\n", is_model_text=False)
             return
         if event_name == "model_parsed":
             kind = event.get("kind", "")
             if kind == "tool":
                 name = event.get("tool_name") or "tool"
                 args = event.get("tool_args") or {}
-                self._write(f"model> requested {name} {self._format_args(args)}\n", is_model_text=False)
+                self._write(f"◆ pico requests {name} {self._format_args(args)}\n", is_model_text=False)
             elif kind == "tool_list":
                 count = event.get("tool_count") or 0
-                self._write(f"model> requested {count} tools\n", is_model_text=False)
+                self._write(f"◆ pico requests {count} tools\n", is_model_text=False)
             elif kind == "retry":
-                self._write("model> response was malformed; asking again\n", is_model_text=False)
+                self._write("◆ pico got malformed output · asking again\n", is_model_text=False)
             return
         if event_name == "tool_batch_started":
             count = event.get("tool_count") or 0
             mode = event.get("execution_mode") or "batch"
-            self._write(f"tool> starting {count} tools ({mode})\n", is_model_text=False)
+            self._write(f"◇ tools start · {count} · {mode}\n", is_model_text=False)
             return
         if event_name == "tool_executed":
             name = event.get("name") or "tool"
@@ -177,8 +177,8 @@ class TerminalModelPrinter:
             call_id = event.get("tool_call_id")
             label = f"{name}#{call_id}" if call_id else name
             duration_ms = event.get("duration_ms")
-            suffix = f" ({duration_ms}ms)" if duration_ms is not None else ""
-            self._write(f"tool> {label} {self._format_args(args)} -> {status}{suffix}\n", is_model_text=False)
+            suffix = f" · {duration_ms}ms" if duration_ms is not None else ""
+            self._write(f"└─ {label} {self._format_args(args)} · {status}{suffix}\n", is_model_text=False)
 
     def _format_args(self, args):
         if not args:
