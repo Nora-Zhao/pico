@@ -56,6 +56,8 @@ HELP_DETAILS = textwrap.dedent(
 
 
 class TerminalModelPrinter:
+    STAGE_OPEN = "<stage>"
+    STAGE_CLOSE = "</stage>"
     FINAL_OPEN = "<final>"
     FINAL_CLOSE = "</final>"
 
@@ -64,12 +66,16 @@ class TerminalModelPrinter:
         self.reset()
 
     def reset(self):
-        self.mode = "unknown"
-        self.buffer = ""
+        self.reset_model_output()
         self.printed = False
         self.text_printed = False
+        self.final_text_printed = False
 
-    def _write(self, text, is_model_text=True):
+    def reset_model_output(self):
+        self.mode = "unknown"
+        self.buffer = ""
+
+    def _write(self, text, is_model_text=True, is_final_text=False):
         if not text:
             return
         self.stream.write(text)
@@ -77,12 +83,14 @@ class TerminalModelPrinter:
         self.printed = True
         if is_model_text:
             self.text_printed = True
+        if is_final_text:
+            self.final_text_printed = True
 
     def feed(self, delta):
         if not delta or self.mode == "done":
             return
         if self.mode == "plain":
-            self._write(delta)
+            self._write(delta, is_final_text=True)
             return
         if self.mode == "tool":
             return
@@ -95,9 +103,14 @@ class TerminalModelPrinter:
             prefix = self.buffer.lstrip()
             if not prefix:
                 return
-            if self.FINAL_OPEN.startswith(prefix) and len(prefix) < len(self.FINAL_OPEN):
+            if self.STAGE_OPEN.startswith(prefix) and len(prefix) < len(self.STAGE_OPEN):
                 return
-            if prefix.startswith(self.FINAL_OPEN):
+            if prefix.startswith(self.STAGE_OPEN):
+                self.mode = "stage"
+                self.buffer = prefix[len(self.STAGE_OPEN):]
+            elif self.FINAL_OPEN.startswith(prefix) and len(prefix) < len(self.FINAL_OPEN):
+                return
+            elif prefix.startswith(self.FINAL_OPEN):
                 self.mode = "final"
                 self.buffer = prefix[len(self.FINAL_OPEN):]
             elif "<tool".startswith(prefix) and len(prefix) < len("<tool"):
@@ -110,26 +123,32 @@ class TerminalModelPrinter:
                 self.mode = "plain"
 
         if self.mode == "plain":
-            self._write(self.buffer)
+            self._write(self.buffer, is_final_text=True)
             self.buffer = ""
             return
 
-        if self.mode == "final" and self.FINAL_CLOSE in self.buffer:
-            text, _, _tail = self.buffer.partition(self.FINAL_CLOSE)
-            self._write(text)
+        if self.mode in {"stage", "final"}:
+            close_tag = self.STAGE_CLOSE if self.mode == "stage" else self.FINAL_CLOSE
+        else:
+            close_tag = ""
+
+        if self.mode in {"stage", "final"} and close_tag in self.buffer:
+            text, _, _tail = self.buffer.partition(close_tag)
+            self._write(text, is_final_text=self.mode == "final")
             self.buffer = ""
             self.mode = "done"
             return
 
-        if self.mode == "final":
-            keep = len(self.FINAL_CLOSE) - 1
+        if self.mode in {"stage", "final"}:
+            keep = len(close_tag) - 1
             if len(self.buffer) > keep:
-                self._write(self.buffer[:-keep])
+                self._write(self.buffer[:-keep], is_final_text=self.mode == "final")
                 self.buffer = self.buffer[-keep:]
 
     def feed_event(self, event):
         event_name = event.get("event", "")
         if event_name == "model_requested":
+            self.reset_model_output()
             attempts = event.get("attempts")
             tool_steps = event.get("tool_steps")
             self._write(f"model> thinking (attempt {attempts}, tools {tool_steps})\n", is_model_text=False)
@@ -140,16 +159,26 @@ class TerminalModelPrinter:
                 name = event.get("tool_name") or "tool"
                 args = event.get("tool_args") or {}
                 self._write(f"model> requested {name} {self._format_args(args)}\n", is_model_text=False)
+            elif kind == "tool_list":
+                count = event.get("tool_count") or 0
+                self._write(f"model> requested {count} tools\n", is_model_text=False)
             elif kind == "retry":
                 self._write("model> response was malformed; asking again\n", is_model_text=False)
+            return
+        if event_name == "tool_batch_started":
+            count = event.get("tool_count") or 0
+            mode = event.get("execution_mode") or "batch"
+            self._write(f"tool> starting {count} tools ({mode})\n", is_model_text=False)
             return
         if event_name == "tool_executed":
             name = event.get("name") or "tool"
             args = event.get("args") or {}
             status = event.get("tool_status") or "done"
+            call_id = event.get("tool_call_id")
+            label = f"{name}#{call_id}" if call_id else name
             duration_ms = event.get("duration_ms")
             suffix = f" ({duration_ms}ms)" if duration_ms is not None else ""
-            self._write(f"tool> {name} {self._format_args(args)} -> {status}{suffix}\n", is_model_text=False)
+            self._write(f"tool> {label} {self._format_args(args)} -> {status}{suffix}\n", is_model_text=False)
 
     def _format_args(self, args):
         if not args:
@@ -161,14 +190,15 @@ class TerminalModelPrinter:
 
     def finish(self):
         self._flush_model_text()
-        if self.mode == "final":
-            if self.FINAL_CLOSE in self.buffer:
-                text, _, _tail = self.buffer.partition(self.FINAL_CLOSE)
-                self._write(text)
+        if self.mode in {"stage", "final"}:
+            close_tag = self.STAGE_CLOSE if self.mode == "stage" else self.FINAL_CLOSE
+            if close_tag in self.buffer:
+                text, _, _tail = self.buffer.partition(close_tag)
+                self._write(text, is_final_text=self.mode == "final")
             else:
-                self._write(self.buffer)
+                self._write(self.buffer, is_final_text=self.mode == "final")
         elif self.mode in {"unknown", "plain"}:
-            self._write(self.buffer)
+            self._write(self.buffer, is_final_text=True)
         self.buffer = ""
         if self.text_printed:
             self.stream.write("\n")
@@ -191,6 +221,7 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
 DEFAULT_DEEPSEEK2_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK2_BASE_URL = "https://api.deepseek.com"
+DEFAULT_MAX_PARALLEL_TOOLS = 5
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
 
@@ -239,6 +270,16 @@ def _configured_secret_names(args):
             if item.strip()
         )
     return sorted(configured_secret_names)
+
+
+def _configured_max_parallel_tools():
+    raw = os.environ.get("PICO_MAX_PARALLEL_TOOLS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_PARALLEL_TOOLS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MAX_PARALLEL_TOOLS
 
 
 def _build_model_client(args):
@@ -374,6 +415,7 @@ def build_agent(args):
     workspace = WorkspaceContext.build(args.cwd)
     load_project_env(workspace.repo_root)
     configured_secret_names = _configured_secret_names(args)
+    max_parallel_tools = _configured_max_parallel_tools()
     store = SessionStore(workspace.repo_root + "/.pico/sessions")
     model = _build_model_client(args)
     session_id = args.resume
@@ -388,6 +430,7 @@ def build_agent(args):
             approval_policy=args.approval,
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
+            max_parallel_tools=max_parallel_tools,
             secret_env_names=configured_secret_names,
         )
     return Pico(
@@ -397,6 +440,7 @@ def build_agent(args):
         approval_policy=args.approval,
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
+        max_parallel_tools=max_parallel_tools,
         secret_env_names=configured_secret_names,
     )
 
@@ -428,7 +472,7 @@ def build_arg_parser():
         help="Extra environment variable names to treat as secrets for trace/report redaction.",
     )
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     return parser
@@ -438,7 +482,7 @@ def print_agent_turn(agent, prompt, printer):
     printer.reset()
     answer = agent.ask(prompt)
     printer.finish()
-    if not printer.text_printed:
+    if not printer.final_text_printed:
         print(answer)
 
 

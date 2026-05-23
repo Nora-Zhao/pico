@@ -10,9 +10,9 @@ import json
 from dataclasses import dataclass
 
 
-DEFAULT_TOTAL_BUDGET = 12000
+DEFAULT_TOTAL_BUDGET = 13000
 DEFAULT_SECTION_BUDGETS = {
-    "prefix": 3600,
+    "prefix": 4200,
     "memory": 1600,
     "relevant_memory": 1200,
     "history": 5200,

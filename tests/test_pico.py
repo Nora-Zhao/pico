@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pico as mini_pkg
-from pico.cli import TerminalModelPrinter
+from pico.cli import TerminalModelPrinter, print_agent_turn
 from pico import (
     AnthropicCompatibleModelClient,
     FakeModelClient,
@@ -55,6 +55,84 @@ def test_agent_runs_tool_then_final(tmp_path):
     assert answer == "Read the file successfully."
     assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
     assert "hello.txt" in agent.session["memory"]["files"]
+
+
+def test_agent_runs_parallel_tool_list_and_records_batch_trace(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("beta\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            '<stage>Reading both files.</stage><tool-list>[{"id":"a","name":"read_file","args":{"path":"a.txt"}},{"id":"b","name":"read_file","args":{"path":"b.txt"}}]</tool-list>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    assert agent.ask("Read both files") == "Done."
+
+    tool_items = [item for item in agent.session["history"] if item["role"] == "tool"]
+    assert [item["tool_call_id"] for item in tool_items] == ["a", "b"]
+    assert len({item["parallel_group_id"] for item in tool_items}) == 1
+    assert {item["execution_mode"] for item in tool_items} == {"parallel"}
+    assert any(item["role"] == "assistant" and item["content"] == "Reading both files." for item in agent.session["history"])
+
+    run_dir = next((tmp_path / ".pico" / "runs").iterdir())
+    trace_events = [json.loads(line) for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    tool_events = [event for event in trace_events if event["event"] == "tool_executed"]
+    assert [event["tool_call_id"] for event in tool_events] == ["a", "b"]
+    assert len({event["parallel_group_id"] for event in tool_events}) == 1
+    assert {event["execution_mode"] for event in tool_events} == {"parallel"}
+    assert any(event["event"] == "tool_batch_started" for event in trace_events)
+    assert any(event["event"] == "assistant_stage" for event in trace_events)
+
+
+def test_agent_runs_tool_list_with_risky_tool_serially(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool-list>[{"id":"read","name":"read_file","args":{"path":"README.md"}},{"id":"write","name":"write_file","args":{"path":"notes.txt","content":"hello"}}]</tool-list>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    assert agent.ask("Read and write") == "Done."
+    tool_items = [item for item in agent.session["history"] if item["role"] == "tool"]
+    assert [item["tool_call_id"] for item in tool_items] == ["read", "write"]
+    assert {item["execution_mode"] for item in tool_items} == {"tool_list_serial"}
+    assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_agent_rejects_tool_list_with_duplicate_mutating_path(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool-list>[{"id":"w1","name":"write_file","args":{"path":"notes.txt","content":"one"}},{"id":"w2","name":"patch_file","args":{"path":"./notes.txt","old_text":"one","new_text":"two"}}]</tool-list>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    assert agent.ask("Write twice") == "Done."
+    assert not (tmp_path / "notes.txt").exists()
+    assert any(
+        item["role"] == "assistant" and "multiple write/patch calls" in item["content"]
+        for item in agent.session["history"]
+    )
+
+
+def test_agent_returns_stage_when_step_limit_reached(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            '<stage>I found the first file.</stage><tool>{"name":"read_file","args":{"path":"a.txt"}}</tool>',
+        ],
+        max_steps=1,
+    )
+
+    answer = agent.ask("Inspect")
+
+    assert answer.startswith("I found the first file.")
+    assert "step limit" in answer
 
 
 def test_agent_updates_task_summary_on_each_request(tmp_path):
@@ -162,6 +240,22 @@ def test_agent_retries_after_malformed_tool_payload(tmp_path):
     assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
     notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
     assert any("valid <tool> call" in item for item in notices)
+
+
+def test_agent_retries_incomplete_final_answer(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            "<final>This answer was cut off",
+            "<final>Complete answer.</final>",
+        ],
+    )
+
+    answer = agent.ask("Answer fully")
+
+    assert answer == "Complete answer."
+    notices = [item["content"] for item in agent.session["history"] if item["role"] == "assistant"]
+    assert any("incomplete <final>" in item for item in notices)
 
 
 def test_agent_accepts_xml_write_file_tool(tmp_path):
@@ -324,6 +418,52 @@ def test_terminal_model_printer_streams_final_content_without_tags():
     printer.finish()
 
     assert stream.getvalue() == "Hello\n"
+
+
+def test_terminal_model_printer_streams_stage_content_without_tags():
+    stream = StringIO()
+    printer = TerminalModelPrinter(stream=stream)
+
+    for delta in ["<st", "age>Plan", " now</st", "age>"]:
+        printer.feed(delta)
+    printer.finish()
+
+    assert stream.getvalue() == "Plan now\n"
+
+
+def test_terminal_model_printer_prints_final_after_stage_in_later_attempt():
+    stream = StringIO()
+    printer = TerminalModelPrinter(stream=stream)
+
+    printer.feed_event({"event": "model_requested", "attempts": 1, "tool_steps": 0})
+    printer.feed("<stage>Reading files.</stage>")
+    printer.feed_event({"event": "model_parsed", "kind": "tool_list", "tool_count": 2})
+    printer.feed_event({"event": "model_requested", "attempts": 2, "tool_steps": 2})
+    printer.feed("<final>Here is the answer.")
+    printer.finish()
+
+    output = stream.getvalue()
+    assert "Reading files." in output
+    assert "Here is the answer." in output
+    assert printer.final_text_printed is True
+
+
+def test_print_agent_turn_prints_answer_when_only_stage_was_streamed(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        ['<stage>Partial result.</stage><tool>{"name":"read_file","args":{"path":"a.txt"}}</tool>'],
+        max_steps=1,
+    )
+    stream = StringIO()
+    printer = TerminalModelPrinter(stream=stream)
+
+    with patch("sys.stdout", stream):
+        print_agent_turn(agent, "Inspect", printer)
+
+    output = stream.getvalue()
+    assert "Partial result." in output
+    assert "Stopped after reaching the step limit" in output
 
 
 def test_terminal_model_printer_hides_tool_call_text():

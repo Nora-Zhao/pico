@@ -164,6 +164,30 @@ PICO_DEEPSEEK2_MODEL="deepseek-v4-pro"
 uv run pico --provider deepseek2
 ```
 
+## 工具调用协议
+
+模型可以输出一个阶段说明，再请求工具：
+
+```xml
+<stage>我先并行读取两个相关文件。</stage>
+<tool-list>
+[
+  {"id":"memory","name":"read_file","args":{"path":"pico/memory.py"}},
+  {"id":"context","name":"read_file","args":{"path":"pico/context_manager.py"}}
+]
+</tool-list>
+```
+
+`<stage>` 会直接显示在终端，也会写入会话历史；如果工具步数达到上限，它会作为当前阶段结果返回给用户。
+
+`<tool-list>` 默认最多包含 5 个工具，可以通过 `.env` 调整：
+
+```bash
+PICO_MAX_PARALLEL_TOOLS=5
+```
+
+当一批工具里没有高风险工具时，pico 会并行执行。只要包含 `write_file`、`patch_file`、`run_shell` 这类需要审批的工具，这批调用会按顺序执行并在 trace 里标记为 `tool_list_serial`。同一批里多个写入/补丁操作指向同一个文件会被拒绝，模型需要拆成多轮。
+
 ## 常用交互命令
 
 - `/help`：查看内置命令

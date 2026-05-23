@@ -11,6 +11,7 @@ import textwrap
 import uuid
 import hashlib
 import time
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,8 @@ DEFAULT_FEATURE_FLAGS = {
     "context_reduction": True,
     "prompt_cache": True,
 }
+DEFAULT_MAX_PARALLEL_TOOLS = 5
+MUTATING_FILE_TOOLS = {"write_file", "patch_file"}
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
 CHECKPOINT_NONE_STATUS = "no-checkpoint"
 CHECKPOINT_FULL_VALID_STATUS = "full-valid"
@@ -61,6 +64,20 @@ class PromptPrefix:
     workspace_fingerprint: str
     tool_signature: str
     built_at: str
+
+
+@dataclass
+class ToolExecution:
+    name: str
+    args: dict
+    result: str
+    metadata: dict
+    duration_ms: int
+    tool_call_id: str
+    parallel_group_id: str
+    execution_mode: str
+    tool_index: int
+    tool_count: int
 
 
 class SessionStore:
@@ -94,7 +111,7 @@ class Pico:
         run_store=None,
         approval_policy="ask",
         max_steps=6,
-        max_new_tokens=512,
+        max_new_tokens=1024,
         depth=0,
         max_depth=1,
         read_only=False,
@@ -103,6 +120,7 @@ class Pico:
         feature_flags=None,
         on_model_delta=None,
         on_runtime_event=None,
+        max_parallel_tools=DEFAULT_MAX_PARALLEL_TOOLS,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -111,6 +129,7 @@ class Pico:
         self.approval_policy = approval_policy
         self.max_steps = max_steps
         self.max_new_tokens = max_new_tokens
+        self.max_parallel_tools = max(1, int(max_parallel_tools or DEFAULT_MAX_PARALLEL_TOOLS))
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
@@ -190,6 +209,7 @@ class Pico:
             "read_only": bool(self.read_only),
             "max_steps": int(self.max_steps),
             "max_new_tokens": int(self.max_new_tokens),
+            "max_parallel_tools": int(self.max_parallel_tools),
             "feature_flags": dict(self.feature_flags),
             "shell_env_allowlist": list(self.shell_env_allowlist),
             "workspace_fingerprint": getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", self.workspace.fingerprint()),
@@ -241,6 +261,7 @@ class Pico:
                     "read_only",
                     "max_steps",
                     "max_new_tokens",
+                    "max_parallel_tools",
                     "feature_flags",
                     "shell_env_allowlist",
                     "workspace_fingerprint",
@@ -333,6 +354,8 @@ class Pico:
         tool_text = "\n".join(tool_lines)
         examples = "\n".join(
             [
+                "<stage>I will inspect the main runtime and tool registry in parallel.</stage>",
+                '<tool-list>[{"id":"runtime","name":"read_file","args":{"path":"pico/runtime.py","start":760,"end":980}},{"id":"tools","name":"read_file","args":{"path":"pico/tools.py","start":1,"end":140}}]</tool-list>',
                 '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
                 '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
                 '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
@@ -349,9 +372,12 @@ class Pico:
 
             Rules:
             - Use tools instead of guessing about the workspace.
-            - Return exactly one <tool>...</tool> or one <final>...</final>.
+            - You may include one <stage>...</stage> progress update before a tool request. This stage is user-visible and will be saved.
+            - Then return exactly one <tool>...</tool>, one <tool-list>...</tool-list>, or one <final>...</final>.
             - Tool calls must look like:
               <tool>{{"name":"tool_name","args":{{...}}}}</tool>
+            - Parallel tool calls must look like a JSON array with at most {self.max_parallel_tools} items:
+              <tool-list>[{{"id":"short_label","name":"tool_name","args":{{...}}}}]</tool-list>
             - For write_file and patch_file with multi-line text, prefer XML style:
               <tool name="write_file" path="file.py"><content>...</content></tool>
             - Final answers must look like:
@@ -430,7 +456,15 @@ class Pico:
 
             if item["role"] == "tool":
                 limit = 900 if recent else 180
-                lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
+                call_suffix = ""
+                if item.get("tool_call_id") or item.get("parallel_group_id"):
+                    call_suffix = (
+                        f"#{item.get('tool_call_id', '')}"
+                        f" {item.get('execution_mode', '')}:{item.get('parallel_group_id', '')}"
+                        f" {item.get('tool_index', '')}/{item.get('tool_count', '')}"
+                    ).strip()
+                    call_suffix = " " + call_suffix if call_suffix else ""
+                lines.append(f"[tool:{item['name']}{call_suffix}] {json.dumps(item['args'], sort_keys=True)}")
                 lines.append(clip(item["content"], limit))
             else:
                 limit = 900 if recent else 220
@@ -760,6 +794,21 @@ class Pico:
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
 
+    def record_assistant_stage(self, task_state, stage):
+        stage = str(stage or "").strip()
+        if not stage:
+            return ""
+        self.record({"role": "assistant", "content": stage, "created_at": now()})
+        self.emit_trace(
+            task_state,
+            "assistant_stage",
+            {
+                "content": clip(stage, 500),
+                "source": "model_stage_tag",
+            },
+        )
+        return stage
+
     def ask(self, user_message):
         """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
 
@@ -800,6 +849,7 @@ class Pico:
         tool_steps = 0
         attempts = 0
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)
+        last_stage = ""
 
         # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
         # 1. 感知：重新组 prompt，把当前状态整理给模型看
@@ -892,6 +942,13 @@ class Pico:
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
             kind, payload = self.parse(raw)
+            parsed_stage = payload.get("stage", "") if isinstance(payload, dict) else ""
+            parsed_tools = []
+            if isinstance(payload, dict):
+                if kind == "tool":
+                    parsed_tools = [payload]
+                elif kind == "tool_list":
+                    parsed_tools = list(payload.get("tools", []) or [])
             self.emit_trace(
                 task_state,
                 "model_parsed",
@@ -899,40 +956,84 @@ class Pico:
                     "kind": kind,
                     "tool_name": payload.get("name", "") if kind == "tool" and isinstance(payload, dict) else "",
                     "tool_args": payload.get("args", {}) if kind == "tool" and isinstance(payload, dict) else {},
+                    "tool_count": len(parsed_tools),
+                    "stage": clip(parsed_stage, 500),
                     "raw_preview": clip(raw, 500),
                     "completion_metadata": completion_metadata,
                     "duration_ms": int((time.monotonic() - model_started_at) * 1000),
                 },
             )
 
-            if kind == "tool":
-                tool_steps += 1
-                name = payload.get("name", "")
-                args = payload.get("args", {})
-                task_state.record_tool(name)
-                tool_started_at = time.monotonic()
-                result = self.run_tool(name, args)
-                self.record(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
-                        "created_at": now(),
-                    }
-                )
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "tool_executed",
-                    {
-                        "name": name,
-                        "args": args,
-                        "result": clip(result, 500),
-                        "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
-                        **dict(self._last_tool_result_metadata or {}),
-                    },
-                )
+            if parsed_stage:
+                last_stage = self.record_assistant_stage(task_state, parsed_stage)
+
+            if kind in {"tool", "tool_list"}:
+                calls = parsed_tools
+                batch_problem = self.validate_tool_batch(calls, self.max_steps - tool_steps)
+                if batch_problem:
+                    self.record({"role": "assistant", "content": self.retry_notice(batch_problem), "created_at": now()})
+                    self.run_store.write_task_state(task_state)
+                    continue
+
+                batch_started_at = time.monotonic()
+                executions = self.run_tool_calls(calls)
+                execution_mode = executions[0].execution_mode if executions else "single"
+                parallel_group_id = executions[0].parallel_group_id if executions else ""
+                if len(executions) > 1:
+                    self.emit_trace(
+                        task_state,
+                        "tool_batch_started",
+                        {
+                            "parallel_group_id": parallel_group_id,
+                            "tool_count": len(executions),
+                            "execution_mode": execution_mode,
+                        },
+                    )
+                for execution in executions:
+                    tool_steps += 1
+                    task_state.record_tool(execution.name)
+                    self.record(
+                        {
+                            "role": "tool",
+                            "name": execution.name,
+                            "args": execution.args,
+                            "content": execution.result,
+                            "created_at": now(),
+                            "tool_call_id": execution.tool_call_id,
+                            "parallel_group_id": execution.parallel_group_id,
+                            "execution_mode": execution.execution_mode,
+                            "tool_index": execution.tool_index,
+                            "tool_count": execution.tool_count,
+                        }
+                    )
+                    self.run_store.write_task_state(task_state)
+                    self.emit_trace(
+                        task_state,
+                        "tool_executed",
+                        {
+                            "name": execution.name,
+                            "args": execution.args,
+                            "result": clip(execution.result, 500),
+                            "duration_ms": execution.duration_ms,
+                            "tool_call_id": execution.tool_call_id,
+                            "parallel_group_id": execution.parallel_group_id,
+                            "execution_mode": execution.execution_mode,
+                            "tool_index": execution.tool_index,
+                            "tool_count": execution.tool_count,
+                            **dict(execution.metadata or {}),
+                        },
+                    )
+                if len(executions) > 1:
+                    self.emit_trace(
+                        task_state,
+                        "tool_batch_finished",
+                        {
+                            "parallel_group_id": parallel_group_id,
+                            "tool_count": len(executions),
+                            "execution_mode": execution_mode,
+                            "duration_ms": int((time.monotonic() - batch_started_at) * 1000),
+                        },
+                    )
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
@@ -980,9 +1081,15 @@ class Pico:
         if attempts >= max_attempts and tool_steps < self.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
             task_state.stop_retry_limit(final)
+            if last_stage:
+                final = last_stage + "\n\nStopped after too many malformed model responses before a final answer."
+                task_state.final_answer = final
         else:
             final = "Stopped after reaching the step limit without a final answer."
             task_state.stop_step_limit(final)
+            if last_stage:
+                final = last_stage + "\n\nStopped after reaching the step limit before a final answer."
+                task_state.final_answer = final
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.promote_durable_memory(user_message, final)
         self.run_store.write_task_state(task_state)
@@ -1009,30 +1116,15 @@ class Pico:
         return final
 
     def run_tool(self, name, args):
-        """执行一次工具调用，并在执行前后套上完整护栏。
+        result, metadata = self.execute_tool(name, args)
+        self._last_tool_result_metadata = metadata
+        return result
 
-        为什么存在：
-        在 agent 系统里，真正危险的不是“模型会不会想调用工具”，而是
-        “平台有没有在执行前把边界守住”。这个函数就是工具层的总闸口：
-        所有工具调用都必须先经过它，不能让模型直接碰到底层函数。
-
-        输入 / 输出：
-        - 输入：工具名 `name`，参数字典 `args`
-        - 输出：字符串结果。无论是成功结果还是错误信息，都会统一返回文本，
-          这样模型下一轮都能继续消费这份反馈。
-
-        在 agent 链路里的位置：
-        它位于 `ask()` 的“模型决定要调用工具”之后，是控制循环里真正把模型
-        意图落到外部世界的一步。因此这里串起了几乎所有安全与可控设计：
-        工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
-        是否需要回写记忆。
-        """
-        # 工具执行不是“直接调函数”，而是一条带护栏的流水线：
-        # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
-        # -> 真正执行 -> 更新记忆。
+    def execute_tool(self, name, args, update_memory=True):
+        """执行一次工具调用，返回工具文本结果和结构化 metadata。"""
         tool = self.tools.get(name)
         if tool is None:
-            self._last_tool_result_metadata = {
+            metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "unknown_tool",
                 "security_event_type": "",
@@ -1042,7 +1134,7 @@ class Pico:
                 "workspace_changed": False,
                 "diff_summary": [],
             }
-            return f"error: unknown tool '{name}'"
+            return f"error: unknown tool '{name}'", metadata
         try:
             self.validate_tool(name, args)
         except Exception as exc:
@@ -1051,7 +1143,7 @@ class Pico:
             if example:
                 message += f"\nexample: {example}"
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
-            self._last_tool_result_metadata = {
+            metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "invalid_arguments",
                 "security_event_type": security_event_type,
@@ -1061,9 +1153,9 @@ class Pico:
                 "workspace_changed": False,
                 "diff_summary": [],
             }
-            return message
+            return message, metadata
         if self.repeated_tool_call(name, args):
-            self._last_tool_result_metadata = {
+            metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "repeated_identical_call",
                 "security_event_type": "",
@@ -1073,9 +1165,9 @@ class Pico:
                 "workspace_changed": False,
                 "diff_summary": [],
             }
-            return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+            return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer", metadata
         if tool["risky"] and not self.approve(name, args):
-            self._last_tool_result_metadata = {
+            metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "approval_denied",
                 "security_event_type": "read_only_block" if self.read_only else "approval_denied",
@@ -1085,7 +1177,7 @@ class Pico:
                 "workspace_changed": False,
                 "diff_summary": [],
             }
-            return f"error: approval denied for {name}"
+            return f"error: approval denied for {name}", metadata
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
@@ -1104,8 +1196,7 @@ class Pico:
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
-            self.update_memory_after_tool(name, args, result)
-            self._last_tool_result_metadata = {
+            metadata = {
                 "tool_status": tool_status,
                 "tool_error_code": tool_error_code,
                 "security_event_type": "",
@@ -1116,14 +1207,16 @@ class Pico:
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
             }
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
-            return result
+            if update_memory:
+                self.update_memory_after_tool(name, args, result)
+                self.record_process_note_for_tool(name, metadata)
+            return result, metadata
         except Exception as exc:
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
-            self._last_tool_result_metadata = {
+            metadata = {
                 "tool_status": "partial_success" if workspace_changed else "error",
                 "tool_error_code": "tool_partial_success" if workspace_changed else "tool_failed",
                 "security_event_type": security_event_type,
@@ -1134,8 +1227,88 @@ class Pico:
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
             }
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
-            return f"error: tool {name} failed: {exc}"
+            if update_memory:
+                self.record_process_note_for_tool(name, metadata)
+            return f"error: tool {name} failed: {exc}", metadata
+
+    def run_tool_calls(self, calls):
+        group_id = "pg_" + uuid.uuid4().hex[:8]
+        tool_count = len(calls)
+        risky_tools = {
+            name
+            for name, tool in self.tools.items()
+            if bool(tool.get("risky"))
+        }
+        has_risky = any(call["name"] in risky_tools for call in calls)
+        execution_mode = "parallel" if tool_count > 1 and not has_risky else ("single" if tool_count == 1 else "tool_list_serial")
+        normalized = []
+        for index, call in enumerate(calls, start=1):
+            call_id = str(call.get("id") or f"{group_id}_{index}").strip() or f"{group_id}_{index}"
+            normalized.append(
+                {
+                    "tool_call_id": call_id,
+                    "parallel_group_id": group_id,
+                    "execution_mode": execution_mode,
+                    "tool_index": index,
+                    "tool_count": tool_count,
+                    "name": call["name"],
+                    "args": call.get("args", {}),
+                }
+            )
+        if execution_mode == "parallel":
+            return asyncio.run(self.run_tool_calls_async(normalized))
+        return [self.execute_tool_call(call, update_memory=True) for call in normalized]
+
+    def validate_tool_batch(self, calls, remaining_steps):
+        if not calls:
+            return "tool-list must contain at least one tool"
+        if len(calls) > self.max_parallel_tools:
+            return f"tool-list contains {len(calls)} tools; max is {self.max_parallel_tools}"
+        if len(calls) > remaining_steps:
+            return f"tool request exceeds remaining tool budget ({remaining_steps})"
+        mutating_paths = {}
+        for call in calls:
+            if call.get("name") not in MUTATING_FILE_TOOLS:
+                continue
+            raw_path = str((call.get("args") or {}).get("path", "")).strip()
+            if not raw_path:
+                continue
+            try:
+                path_key = str(self.path(raw_path))
+            except Exception:
+                path_key = raw_path
+            previous = mutating_paths.get(path_key)
+            if previous:
+                return f"tool-list has multiple write/patch calls for the same path: {raw_path}"
+            mutating_paths[path_key] = True
+        return ""
+
+    async def run_tool_calls_async(self, calls):
+        tasks = [
+            asyncio.to_thread(self.execute_tool_call, call, False)
+            for call in calls
+        ]
+        results = await asyncio.gather(*tasks)
+        for execution in results:
+            self.update_memory_after_tool(execution.name, execution.args, execution.result)
+            self.record_process_note_for_tool(execution.name, execution.metadata)
+        return results
+
+    def execute_tool_call(self, call, update_memory=True):
+        started_at = time.monotonic()
+        result, metadata = self.execute_tool(call["name"], call.get("args", {}), update_memory=update_memory)
+        return ToolExecution(
+            name=call["name"],
+            args=call.get("args", {}),
+            result=result,
+            metadata=dict(metadata or {}),
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+            tool_call_id=call["tool_call_id"],
+            parallel_group_id=call["parallel_group_id"],
+            execution_mode=call["execution_mode"],
+            tool_index=call["tool_index"],
+            tool_count=call["tool_count"],
+        )
 
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
@@ -1237,31 +1410,48 @@ class Pico:
         进入平台控制流的第一道结构化关口。
         """
         raw = str(raw)
+        stage = Pico.extract_leading_stage(raw)
         # 这里支持两种工具格式：
         # 1. <tool>...</tool> 里包 JSON，适合简短调用
         # 2. XML 风格属性/子标签，适合写文件这类多行内容
+        if "<tool-list>" in raw and ("<final>" not in raw or raw.find("<tool-list>") < raw.find("<final>")):
+            body = Pico.extract_raw(raw, "tool-list")
+            try:
+                items = json.loads(body)
+            except Exception:
+                return "retry", Pico.retry_notice("model returned malformed tool-list JSON")
+            if not isinstance(items, list):
+                return "retry", Pico.retry_notice("tool-list payload must be a JSON array")
+            calls = []
+            for index, item in enumerate(items, start=1):
+                call = Pico.normalize_tool_call(item, index)
+                if isinstance(call, str):
+                    return "retry", Pico.retry_notice(call)
+                calls.append(call)
+            if not calls:
+                return "retry", Pico.retry_notice("tool-list must contain at least one tool")
+            return "tool_list", {"stage": stage, "tools": calls}
+
         if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
             body = Pico.extract(raw, "tool")
             try:
                 payload = json.loads(body)
             except Exception:
                 return "retry", Pico.retry_notice("model returned malformed tool JSON")
-            if not isinstance(payload, dict):
-                return "retry", Pico.retry_notice("tool payload must be a JSON object")
-            if not str(payload.get("name", "")).strip():
-                return "retry", Pico.retry_notice("tool payload is missing a tool name")
-            args = payload.get("args", {})
-            if args is None:
-                payload["args"] = {}
-            elif not isinstance(args, dict):
-                return "retry", Pico.retry_notice()
-            return "tool", payload
+            call = Pico.normalize_tool_call(payload, 1)
+            if isinstance(call, str):
+                return "retry", Pico.retry_notice(call)
+            call["stage"] = stage
+            return "tool", call
         if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
             payload = Pico.parse_xml_tool(raw)
             if payload is not None:
+                payload["stage"] = stage
                 return "tool", payload
             return "retry", Pico.retry_notice()
         if "<final>" in raw:
+            if "</final>" not in raw:
+                return "retry", Pico.retry_notice("model returned an incomplete <final> answer")
             final = Pico.extract(raw, "final").strip()
             if final:
                 return "final", final
@@ -1270,6 +1460,36 @@ class Pico:
         if raw:
             return "final", raw
         return "retry", Pico.retry_notice("model returned an empty response")
+
+    @staticmethod
+    def extract_leading_stage(raw):
+        raw = str(raw)
+        stage_start = raw.find("<stage>")
+        if stage_start == -1:
+            return ""
+        action_positions = [
+            pos
+            for pos in (raw.find("<tool-list>"), raw.find("<tool"), raw.find("<final>"))
+            if pos != -1
+        ]
+        if action_positions and stage_start > min(action_positions):
+            return ""
+        return Pico.extract_raw(raw, "stage").strip()
+
+    @staticmethod
+    def normalize_tool_call(item, index):
+        if not isinstance(item, dict):
+            return "tool call must be a JSON object"
+        name = str(item.get("name", "")).strip()
+        if not name:
+            return "tool payload is missing a tool name"
+        args = item.get("args", {})
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            return "tool args must be a JSON object"
+        call_id = str(item.get("id") or item.get("tool_call_id") or f"call_{index}").strip()
+        return {"id": call_id or f"call_{index}", "name": name, "args": args}
 
     @staticmethod
     def retry_notice(problem=None):
