@@ -34,6 +34,7 @@ DEFAULT_FEATURE_FLAGS = {
 }
 DEFAULT_MAX_PARALLEL_TOOLS = 5
 MUTATING_FILE_TOOLS = {"write_file", "patch_file"}
+SERIAL_TOOL_LIST_TOOLS = {"delegate"}
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
 CHECKPOINT_NONE_STATUS = "no-checkpoint"
 CHECKPOINT_FULL_VALID_STATUS = "full-valid"
@@ -74,6 +75,7 @@ class ToolExecution:
     metadata: dict
     duration_ms: int
     tool_call_id: str
+    model_tool_call_id: str
     parallel_group_id: str
     execution_mode: str
     tool_index: int
@@ -1000,6 +1002,7 @@ class Pico:
                             "content": execution.result,
                             "created_at": now(),
                             "tool_call_id": execution.tool_call_id,
+                            "model_tool_call_id": execution.model_tool_call_id,
                             "parallel_group_id": execution.parallel_group_id,
                             "execution_mode": execution.execution_mode,
                             "tool_index": execution.tool_index,
@@ -1016,6 +1019,7 @@ class Pico:
                             "result": clip(execution.result, 500),
                             "duration_ms": execution.duration_ms,
                             "tool_call_id": execution.tool_call_id,
+                            "model_tool_call_id": execution.model_tool_call_id,
                             "parallel_group_id": execution.parallel_group_id,
                             "execution_mode": execution.execution_mode,
                             "tool_index": execution.tool_index,
@@ -1094,6 +1098,7 @@ class Pico:
         self.promote_durable_memory(user_message, final)
         self.run_store.write_task_state(task_state)
         checkpoint = self.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
+        self.run_store.write_task_state(task_state)
         self.emit_trace(
             task_state,
             "checkpoint_created",
@@ -1239,14 +1244,17 @@ class Pico:
             for name, tool in self.tools.items()
             if bool(tool.get("risky"))
         }
-        has_risky = any(call["name"] in risky_tools for call in calls)
-        execution_mode = "parallel" if tool_count > 1 and not has_risky else ("single" if tool_count == 1 else "tool_list_serial")
+        serial_tools = risky_tools | SERIAL_TOOL_LIST_TOOLS
+        requires_serial = any(call["name"] in serial_tools for call in calls)
+        execution_mode = "parallel" if tool_count > 1 and not requires_serial else ("single" if tool_count == 1 else "tool_list_serial")
         normalized = []
         for index, call in enumerate(calls, start=1):
-            call_id = str(call.get("id") or f"{group_id}_{index}").strip() or f"{group_id}_{index}"
+            model_call_id = str(call.get("id") or call.get("model_tool_call_id") or "").strip()
+            call_id = self.runtime_tool_call_id(group_id, index, model_call_id)
             normalized.append(
                 {
                     "tool_call_id": call_id,
+                    "model_tool_call_id": model_call_id,
                     "parallel_group_id": group_id,
                     "execution_mode": execution_mode,
                     "tool_index": index,
@@ -1304,11 +1312,18 @@ class Pico:
             metadata=dict(metadata or {}),
             duration_ms=int((time.monotonic() - started_at) * 1000),
             tool_call_id=call["tool_call_id"],
+            model_tool_call_id=call.get("model_tool_call_id", ""),
             parallel_group_id=call["parallel_group_id"],
             execution_mode=call["execution_mode"],
             tool_index=call["tool_index"],
             tool_count=call["tool_count"],
         )
+
+    @staticmethod
+    def runtime_tool_call_id(group_id, index, model_call_id=""):
+        label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(model_call_id or "").strip()).strip("._-")
+        suffix = f"_{label[:32]}" if label else ""
+        return f"{group_id}_{int(index):03d}{suffix}"
 
     def repeated_tool_call(self, name, args):
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
@@ -1488,8 +1503,8 @@ class Pico:
             args = {}
         if not isinstance(args, dict):
             return "tool args must be a JSON object"
-        call_id = str(item.get("id") or item.get("tool_call_id") or f"call_{index}").strip()
-        return {"id": call_id or f"call_{index}", "name": name, "args": args}
+        call_id = str(item.get("id") or item.get("tool_call_id") or "").strip()
+        return {"id": call_id, "name": name, "args": args}
 
     @staticmethod
     def retry_notice(problem=None):

@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import subprocess
 import sys
 from http.client import IncompleteRead
@@ -71,7 +72,11 @@ def test_agent_runs_parallel_tool_list_and_records_batch_trace(tmp_path):
     assert agent.ask("Read both files") == "Done."
 
     tool_items = [item for item in agent.session["history"] if item["role"] == "tool"]
-    assert [item["tool_call_id"] for item in tool_items] == ["a", "b"]
+    assert [item["model_tool_call_id"] for item in tool_items] == ["a", "b"]
+    assert [item["tool_call_id"] for item in tool_items] == [
+        f"{tool_items[0]['parallel_group_id']}_001_a",
+        f"{tool_items[0]['parallel_group_id']}_002_b",
+    ]
     assert len({item["parallel_group_id"] for item in tool_items}) == 1
     assert {item["execution_mode"] for item in tool_items} == {"parallel"}
     assert any(item["role"] == "assistant" and item["content"] == "Reading both files." for item in agent.session["history"])
@@ -79,11 +84,34 @@ def test_agent_runs_parallel_tool_list_and_records_batch_trace(tmp_path):
     run_dir = next((tmp_path / ".pico" / "runs").iterdir())
     trace_events = [json.loads(line) for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
     tool_events = [event for event in trace_events if event["event"] == "tool_executed"]
-    assert [event["tool_call_id"] for event in tool_events] == ["a", "b"]
+    assert [event["model_tool_call_id"] for event in tool_events] == ["a", "b"]
+    assert [event["tool_call_id"] for event in tool_events] == [
+        f"{tool_events[0]['parallel_group_id']}_001_a",
+        f"{tool_events[0]['parallel_group_id']}_002_b",
+    ]
     assert len({event["parallel_group_id"] for event in tool_events}) == 1
     assert {event["execution_mode"] for event in tool_events} == {"parallel"}
     assert any(event["event"] == "tool_batch_started" for event in trace_events)
     assert any(event["event"] == "assistant_stage" for event in trace_events)
+
+
+def test_agent_assigns_unique_runtime_tool_ids_when_model_reuses_ids(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("beta\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool-list>[{"id":"same id","name":"read_file","args":{"path":"a.txt"}},{"id":"same id","name":"read_file","args":{"path":"b.txt"}}]</tool-list>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    assert agent.ask("Read both files") == "Done."
+
+    tool_items = [item for item in agent.session["history"] if item["role"] == "tool"]
+    assert [item["model_tool_call_id"] for item in tool_items] == ["same id", "same id"]
+    assert len({item["tool_call_id"] for item in tool_items}) == 2
+    assert all(re.match(r"^pg_[0-9a-f]{8}_00[12]_same_id$", item["tool_call_id"]) for item in tool_items)
 
 
 def test_agent_runs_tool_list_with_risky_tool_serially(tmp_path):
@@ -97,9 +125,32 @@ def test_agent_runs_tool_list_with_risky_tool_serially(tmp_path):
 
     assert agent.ask("Read and write") == "Done."
     tool_items = [item for item in agent.session["history"] if item["role"] == "tool"]
-    assert [item["tool_call_id"] for item in tool_items] == ["read", "write"]
+    assert [item["model_tool_call_id"] for item in tool_items] == ["read", "write"]
+    assert [item["tool_call_id"] for item in tool_items] == [
+        f"{tool_items[0]['parallel_group_id']}_001_read",
+        f"{tool_items[0]['parallel_group_id']}_002_write",
+    ]
     assert {item["execution_mode"] for item in tool_items} == {"tool_list_serial"}
     assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_agent_runs_tool_list_with_delegate_serially(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool-list>[{"id":"read","name":"read_file","args":{"path":"README.md"}},{"id":"child","name":"delegate","args":{"task":"inspect README","max_steps":1}}]</tool-list>',
+            "<final>Child inspected README.</final>",
+            "<final>Done.</final>",
+        ],
+    )
+
+    assert agent.ask("Read and delegate") == "Done."
+
+    tool_items = [item for item in agent.session["history"] if item["role"] == "tool"]
+    assert [item["name"] for item in tool_items] == ["read_file", "delegate"]
+    assert [item["model_tool_call_id"] for item in tool_items] == ["read", "child"]
+    assert {item["execution_mode"] for item in tool_items} == {"tool_list_serial"}
+    assert "delegate_result" in tool_items[1]["content"]
 
 
 def test_agent_rejects_tool_list_with_duplicate_mutating_path(tmp_path):
@@ -133,6 +184,27 @@ def test_agent_returns_stage_when_step_limit_reached(tmp_path):
 
     assert answer.startswith("I found the first file.")
     assert "step limit" in answer
+
+
+def test_step_limit_persists_final_checkpoint_to_task_state(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"path":"a.txt"}}</tool>',
+        ],
+        max_steps=1,
+    )
+
+    agent.ask("Inspect")
+
+    task_state = json.loads(agent.run_store.task_state_path(agent.current_task_state).read_text(encoding="utf-8"))
+    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
+    checkpoint_state = agent.session["checkpoints"]
+
+    assert task_state["checkpoint_id"] == checkpoint_state["current_id"]
+    assert report["checkpoint_id"] == checkpoint_state["current_id"]
+    assert report["task_state"]["checkpoint_id"] == checkpoint_state["current_id"]
 
 
 def test_agent_updates_task_summary_on_each_request(tmp_path):
