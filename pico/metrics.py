@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ DEFAULT_HARNESS_REGRESSION_V2_PATH = Path("artifacts/harness-regression-v2.json"
 DEFAULT_CONTEXT_ABLATION_V2_PATH = Path("artifacts/context-ablation-v2.json")
 DEFAULT_MEMORY_ABLATION_V2_PATH = Path("artifacts/memory-ablation-v2.json")
 DEFAULT_RECOVERY_ABLATION_V2_PATH = Path("artifacts/recovery-ablation-v2.json")
+DEFAULT_PARALLEL_TOOL_ABLATION_V2_PATH = Path("artifacts/parallel-tool-ablation-v2.json")
 DEFAULT_CORE_REPORT_PATH = Path("docs/metrics/pico-benchmark-core-report.md")
 
 
@@ -1612,23 +1614,314 @@ def run_recovery_ablation_v2(artifact_path=DEFAULT_RECOVERY_ABLATION_V2_PATH, re
     return _write_json_artifact(artifact_path, artifact)
 
 
+def _parallel_tool_agent(workspace_root, delay_ms):
+    workspace = WorkspaceContext.build(workspace_root)
+    store = SessionStore(workspace_root / ".pico" / "sessions")
+    agent = Pico(
+        model_client=FakeModelClient([]),
+        workspace=workspace,
+        session_store=store,
+        approval_policy="auto",
+    )
+    original_read = agent.tools["read_file"]["run"]
+
+    def delayed_read(args):
+        time.sleep(max(0, int(delay_ms)) / 1000.0)
+        return original_read(args)
+
+    agent.tools["read_file"] = {**agent.tools["read_file"], "run": delayed_read}
+    return agent
+
+
+def _parallel_tool_calls(tool_count):
+    return [
+        {
+            "id": f"read-{index}",
+            "name": "read_file",
+            "args": {"path": f"file_{index}.txt", "start": 1, "end": 20},
+        }
+        for index in range(1, int(tool_count) + 1)
+    ]
+
+
+def _mutating_tool_calls(tool_count):
+    return [
+        {
+            "id": f"write-{index}",
+            "name": "write_file",
+            "args": {"path": f"out_{index}.txt", "content": f"payload-{index}\n"},
+        }
+        for index in range(1, int(tool_count) + 1)
+    ]
+
+
+class _DelayedFakeModelClient(FakeModelClient):
+    def __init__(self, outputs, delay_ms):
+        super().__init__(outputs)
+        self.delay_ms = int(delay_ms)
+
+    def complete(self, prompt, max_new_tokens, **kwargs):
+        time.sleep(max(0, self.delay_ms) / 1000.0)
+        return super().complete(prompt, max_new_tokens, **kwargs)
+
+
+def _tool_list_output(calls):
+    return "<tool-list>" + json.dumps(calls, ensure_ascii=False) + "</tool-list>"
+
+
+def _single_tool_outputs(calls):
+    return [
+        "<tool>" + json.dumps({"name": call["name"], "args": call["args"]}, ensure_ascii=False) + "</tool>"
+        for call in calls
+    ]
+
+
+def _run_parallel_tool_variant(tool_count, variant, delay_ms):
+    with tempfile.TemporaryDirectory(prefix="pico-parallel-tools-") as temp_dir:
+        workspace_root = Path(temp_dir)
+        (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
+        for index in range(1, int(tool_count) + 1):
+            (workspace_root / f"file_{index}.txt").write_text(f"payload-{index}\n", encoding="utf-8")
+        agent = _parallel_tool_agent(workspace_root, delay_ms)
+        calls = _parallel_tool_calls(tool_count)
+        started = time.monotonic()
+        if variant == "parallel_tool_list":
+            executions = agent.run_tool_calls(calls)
+        elif variant == "serial_single_tools":
+            executions = []
+            for call in calls:
+                executions.extend(agent.run_tool_calls([call]))
+        else:
+            raise ValueError(f"unsupported parallel tool variant: {variant}")
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {
+            "variant": variant,
+            "tool_count": int(tool_count),
+            "delay_ms": int(delay_ms),
+            "elapsed_ms": elapsed_ms,
+            "execution_modes": sorted({execution.execution_mode for execution in executions}),
+            "tool_results": len(executions),
+            "all_read_only": all(not agent.tools[execution.name].get("risky") for execution in executions),
+        }
+
+
+def _end_to_end_tool_agent(workspace_root, outputs, tool_delay_ms, model_delay_ms, max_steps):
+    workspace = WorkspaceContext.build(workspace_root)
+    store = SessionStore(workspace_root / ".pico" / "sessions")
+    agent = Pico(
+        model_client=_DelayedFakeModelClient(outputs, model_delay_ms),
+        workspace=workspace,
+        session_store=store,
+        approval_policy="auto",
+        max_steps=max_steps,
+    )
+    original_read = agent.tools["read_file"]["run"]
+    original_write = agent.tools["write_file"]["run"]
+
+    def delayed_read(args):
+        time.sleep(max(0, int(tool_delay_ms)) / 1000.0)
+        return original_read(args)
+
+    def delayed_write(args):
+        time.sleep(max(0, int(tool_delay_ms)) / 1000.0)
+        return original_write(args)
+
+    agent.tools["read_file"] = {**agent.tools["read_file"], "run": delayed_read}
+    agent.tools["write_file"] = {**agent.tools["write_file"], "run": delayed_write}
+    return agent
+
+
+def _run_end_to_end_tool_variant(tool_count, variant, tool_delay_ms, model_delay_ms):
+    with tempfile.TemporaryDirectory(prefix="pico-tool-roundtrip-") as temp_dir:
+        workspace_root = Path(temp_dir)
+        (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
+        for index in range(1, int(tool_count) + 1):
+            (workspace_root / f"file_{index}.txt").write_text(f"payload-{index}\n", encoding="utf-8")
+        if variant == "safe_parallel_tool_list":
+            calls = _parallel_tool_calls(tool_count)
+            outputs = [_tool_list_output(calls), "<final>Done.</final>"]
+        elif variant == "risky_serial_tool_list":
+            calls = _mutating_tool_calls(tool_count)
+            outputs = [_tool_list_output(calls), "<final>Done.</final>"]
+        elif variant == "safe_serial_single_tools":
+            calls = _parallel_tool_calls(tool_count)
+            outputs = _single_tool_outputs(calls) + ["<final>Done.</final>"]
+        elif variant == "risky_serial_single_tools":
+            calls = _mutating_tool_calls(tool_count)
+            outputs = _single_tool_outputs(calls) + ["<final>Done.</final>"]
+        else:
+            raise ValueError(f"unsupported end-to-end tool variant: {variant}")
+        agent = _end_to_end_tool_agent(
+            workspace_root,
+            outputs,
+            tool_delay_ms=tool_delay_ms,
+            model_delay_ms=model_delay_ms,
+            max_steps=int(tool_count) + 1,
+        )
+        started = time.monotonic()
+        answer = agent.ask("Run the tool benchmark.")
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        trace = [
+            json.loads(line)
+            for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        tool_events = [event for event in trace if event.get("event") == "tool_executed"]
+        batch_events = [event for event in trace if event.get("event") == "tool_batch_started"]
+        return {
+            "variant": variant,
+            "tool_count": int(tool_count),
+            "tool_delay_ms": int(tool_delay_ms),
+            "model_delay_ms": int(model_delay_ms),
+            "elapsed_ms": elapsed_ms,
+            "answer": answer,
+            "attempts": int(agent.current_task_state.attempts),
+            "tool_steps": int(agent.current_task_state.tool_steps),
+            "execution_modes": sorted({event.get("execution_mode") for event in tool_events}),
+            "batch_modes": sorted({event.get("execution_mode") for event in batch_events}),
+        }
+
+
+def run_parallel_tool_ablation_v2(
+    artifact_path=DEFAULT_PARALLEL_TOOL_ABLATION_V2_PATH,
+    repetitions=5,
+    delay_ms=40,
+    model_delay_ms=80,
+    tool_counts=(2, 3, 5),
+):
+    repetitions = int(repetitions)
+    delay_ms = int(delay_ms)
+    model_delay_ms = int(model_delay_ms)
+    tool_counts = [int(count) for count in tool_counts]
+    configs = []
+    rows = []
+    roundtrip_configs = []
+    roundtrip_rows = []
+    for tool_count in tool_counts:
+        per_config = {"parallel_tool_list": [], "serial_single_tools": []}
+        for _ in range(repetitions):
+            for variant in per_config:
+                row = _run_parallel_tool_variant(tool_count, variant, delay_ms)
+                per_config[variant].append(row)
+                rows.append(row)
+        parallel_ms = _safe_mean(row["elapsed_ms"] for row in per_config["parallel_tool_list"])
+        serial_ms = _safe_mean(row["elapsed_ms"] for row in per_config["serial_single_tools"])
+        configs.append(
+            {
+                "id": f"{tool_count}-safe-read-tools",
+                "tool_count": tool_count,
+                "delay_ms": delay_ms,
+                "avg_parallel_elapsed_ms": parallel_ms,
+                "avg_serial_elapsed_ms": serial_ms,
+                "avg_saved_ms": serial_ms - parallel_ms,
+                "speedup": _safe_ratio(serial_ms, parallel_ms),
+                "parallel_mode_rate": _safe_ratio(
+                    sum(1 for row in per_config["parallel_tool_list"] if row["execution_modes"] == ["parallel"]),
+                    len(per_config["parallel_tool_list"]),
+                ),
+                "serial_mode_rate": _safe_ratio(
+                    sum(1 for row in per_config["serial_single_tools"] if row["execution_modes"] == ["single"]),
+                    len(per_config["serial_single_tools"]),
+                ),
+                "read_only_rate": _safe_ratio(
+                    sum(1 for row in per_config["parallel_tool_list"] + per_config["serial_single_tools"] if row["all_read_only"]),
+                    len(per_config["parallel_tool_list"]) + len(per_config["serial_single_tools"]),
+                ),
+            }
+        )
+        roundtrip_per_config = {
+            "safe_parallel_tool_list": [],
+            "safe_serial_single_tools": [],
+            "risky_serial_tool_list": [],
+            "risky_serial_single_tools": [],
+        }
+        for _ in range(repetitions):
+            for variant in roundtrip_per_config:
+                row = _run_end_to_end_tool_variant(tool_count, variant, delay_ms, model_delay_ms)
+                roundtrip_per_config[variant].append(row)
+                roundtrip_rows.append(row)
+        safe_list_ms = _safe_mean(row["elapsed_ms"] for row in roundtrip_per_config["safe_parallel_tool_list"])
+        safe_single_ms = _safe_mean(row["elapsed_ms"] for row in roundtrip_per_config["safe_serial_single_tools"])
+        risky_list_ms = _safe_mean(row["elapsed_ms"] for row in roundtrip_per_config["risky_serial_tool_list"])
+        risky_single_ms = _safe_mean(row["elapsed_ms"] for row in roundtrip_per_config["risky_serial_single_tools"])
+        roundtrip_configs.append(
+            {
+                "id": f"{tool_count}-end-to-end-tools",
+                "tool_count": tool_count,
+                "tool_delay_ms": delay_ms,
+                "model_delay_ms": model_delay_ms,
+                "avg_safe_parallel_tool_list_elapsed_ms": safe_list_ms,
+                "avg_safe_serial_single_tools_elapsed_ms": safe_single_ms,
+                "safe_tool_list_speedup": _safe_ratio(safe_single_ms, safe_list_ms),
+                "avg_risky_serial_tool_list_elapsed_ms": risky_list_ms,
+                "avg_risky_serial_single_tools_elapsed_ms": risky_single_ms,
+                "risky_tool_list_speedup": _safe_ratio(risky_single_ms, risky_list_ms),
+                "risky_tool_list_saved_ms": risky_single_ms - risky_list_ms,
+                "risky_tool_list_attempts": _safe_mean(row["attempts"] for row in roundtrip_per_config["risky_serial_tool_list"]),
+                "risky_serial_single_attempts": _safe_mean(row["attempts"] for row in roundtrip_per_config["risky_serial_single_tools"]),
+                "risky_tool_list_serial_rate": _safe_ratio(
+                    sum(1 for row in roundtrip_per_config["risky_serial_tool_list"] if row["execution_modes"] == ["tool_list_serial"]),
+                    len(roundtrip_per_config["risky_serial_tool_list"]),
+                ),
+            }
+        )
+    summary = {
+        "config_count": len(configs),
+        "runs_per_variant": repetitions * len(tool_counts),
+        "avg_parallel_elapsed_ms": _safe_mean(config["avg_parallel_elapsed_ms"] for config in configs),
+        "avg_serial_elapsed_ms": _safe_mean(config["avg_serial_elapsed_ms"] for config in configs),
+        "avg_saved_ms": _safe_mean(config["avg_saved_ms"] for config in configs),
+        "avg_speedup": _safe_mean(config["speedup"] for config in configs),
+        "max_speedup": max((config["speedup"] for config in configs), default=0.0),
+        "parallel_mode_rate": _safe_ratio(sum(1 for config in configs if config["parallel_mode_rate"] == 1.0), len(configs)),
+        "read_only_rate": _safe_ratio(sum(1 for config in configs if config["read_only_rate"] == 1.0), len(configs)),
+        "avg_risky_tool_list_elapsed_ms": _safe_mean(config["avg_risky_serial_tool_list_elapsed_ms"] for config in roundtrip_configs),
+        "avg_risky_serial_single_elapsed_ms": _safe_mean(config["avg_risky_serial_single_tools_elapsed_ms"] for config in roundtrip_configs),
+        "avg_risky_tool_list_speedup": _safe_mean(config["risky_tool_list_speedup"] for config in roundtrip_configs),
+        "avg_risky_tool_list_saved_ms": _safe_mean(config["risky_tool_list_saved_ms"] for config in roundtrip_configs),
+        "risky_tool_list_serial_rate": _safe_ratio(
+            sum(1 for config in roundtrip_configs if config["risky_tool_list_serial_rate"] == 1.0),
+            len(roundtrip_configs),
+        ),
+    }
+    artifact = {
+        "schema_version": METRICS_SCHEMA_VERSION,
+        "artifact_type": "parallel-tool-ablation-v2",
+        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "benchmark_note": "Synthetic delayed-tool benchmark. Scheduling rows isolate safe-tool runtime parallelism; roundtrip rows measure model-call savings from tool-list batching, including risky serial tool-lists.",
+        "tool_counts": tool_counts,
+        "repetitions": repetitions,
+        "delay_ms": delay_ms,
+        "model_delay_ms": model_delay_ms,
+        "summary": summary,
+        "configs": configs,
+        "roundtrip_configs": roundtrip_configs,
+        "rows": rows,
+        "roundtrip_rows": roundtrip_rows,
+    }
+    return _write_json_artifact(artifact_path, artifact)
+
+
 def write_benchmark_core_report(
     report_path=DEFAULT_CORE_REPORT_PATH,
     harness_artifact_path=DEFAULT_HARNESS_REGRESSION_V2_PATH,
     context_artifact_path=DEFAULT_CONTEXT_ABLATION_V2_PATH,
     memory_artifact_path=DEFAULT_MEMORY_ABLATION_V2_PATH,
     recovery_artifact_path=DEFAULT_RECOVERY_ABLATION_V2_PATH,
+    parallel_artifact_path=DEFAULT_PARALLEL_TOOL_ABLATION_V2_PATH,
 ):
     harness = json.loads(Path(harness_artifact_path).read_text(encoding="utf-8"))
     context = json.loads(Path(context_artifact_path).read_text(encoding="utf-8"))
     memory = json.loads(Path(memory_artifact_path).read_text(encoding="utf-8"))
     recovery = json.loads(Path(recovery_artifact_path).read_text(encoding="utf-8"))
+    parallel = json.loads(Path(parallel_artifact_path).read_text(encoding="utf-8"))
 
     enabled_recovery = recovery["variants"]["resume_enabled"]["summary"]
+    parallel_summary = parallel["summary"]
     lines = [
         "# Pico Benchmark Core Report",
         "",
-        "这轮 benchmark 只收缩到 Harness regression、context ablation、working memory ablation 和 recovery ablation 四层，不把 provider、run aggregation 或 durable memory 的别的结论揉进来。",
+        "这轮 benchmark 只收缩到 Harness regression、context ablation、parallel tool ablation、working memory ablation 和 recovery ablation 五层，不把 provider、run aggregation 或 durable memory 的别的结论揉进来。",
         "",
         "## Harness Regression",
         f"- 固定 regression 任务数：{harness['summary']['total_tasks']}",
@@ -1643,6 +1936,19 @@ def write_benchmark_core_report(
         f"- avg_prompt_compression_ratio：{context['summary']['avg_prompt_compression_ratio']:.2%}",
         f"- max_prompt_compression_ratio：{context['summary']['max_prompt_compression_ratio']:.2%}",
         f"- current_request_preserved_rate：{context['summary']['current_request_preserved_rate']:.2%}",
+        "",
+        "## Parallel Tool Ablation",
+        f"- 配置数：{parallel_summary['config_count']}",
+        f"- avg_parallel_elapsed_ms：{parallel_summary['avg_parallel_elapsed_ms']:.2f}",
+        f"- avg_serial_elapsed_ms：{parallel_summary['avg_serial_elapsed_ms']:.2f}",
+        f"- avg_saved_ms：{parallel_summary['avg_saved_ms']:.2f}",
+        f"- avg_speedup：{parallel_summary['avg_speedup']:.2f}x",
+        f"- max_speedup：{parallel_summary['max_speedup']:.2f}x",
+        f"- parallel_mode_rate：{parallel_summary['parallel_mode_rate']:.2%}",
+        f"- avg_risky_tool_list_elapsed_ms：{parallel_summary['avg_risky_tool_list_elapsed_ms']:.2f}",
+        f"- avg_risky_serial_single_elapsed_ms：{parallel_summary['avg_risky_serial_single_elapsed_ms']:.2f}",
+        f"- avg_risky_tool_list_speedup：{parallel_summary['avg_risky_tool_list_speedup']:.2f}x",
+        f"- risky_tool_list_serial_rate：{parallel_summary['risky_tool_list_serial_rate']:.2%}",
         "",
         "## Working Memory Ablation",
         f"- memory_on repeated_reads：{memory['variants']['memory_on']['repeated_reads']}",
@@ -1662,6 +1968,10 @@ def write_benchmark_core_report(
         "- avg_raw_prompt_chars",
         "- avg_prompt_compression_ratio",
         "- max_prompt_compression_ratio",
+        "- avg_parallel_elapsed_ms",
+        "- avg_serial_elapsed_ms",
+        "- avg_speedup",
+        "- avg_risky_tool_list_speedup",
         "- repeated_reads",
         "- avg_tool_steps",
         "- correct_rate",
@@ -1673,11 +1983,13 @@ def write_benchmark_core_report(
         "- current_request_preserved_rate",
         "- memory_hit_rate",
         "- stale_reanchor_rate",
+        "- parallel_mode_rate",
         "- failure_category_counts",
         "",
         "## 口径边界",
         "- Harness regression 只证明 runtime 合同稳定，不证明 provider 上限。",
-        "- Context、memory、recovery 这三层只证明模块收益，不和 provider benchmark 混写。",
+        "- Parallel tool ablation 使用带固定延迟的安全 read_file 合成任务，证明非危险工具调度收益，不证明模型规划能力。",
+        "- Context、parallel、memory、recovery 这四层只证明模块收益，不和 provider benchmark 混写。",
     ]
     report_text = "\n".join(lines) + "\n"
     report_path = Path(report_path)

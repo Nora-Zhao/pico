@@ -54,6 +54,15 @@ def test_agent_runs_tool_then_final(tmp_path):
     answer = agent.ask("Inspect hello.txt")
 
     assert answer == "Read the file successfully."
+    tool_request = next(item for item in agent.session["history"] if item.get("kind") == "tool_request")
+    assert tool_request["role"] == "assistant"
+    assert tool_request["tool_calls"] == [
+        {
+            "id": "tool-1",
+            "name": "read_file",
+            "args": {"path": "hello.txt", "start": 1, "end": 2},
+        }
+    ]
     assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
     assert "hello.txt" in agent.session["memory"]["files"]
 
@@ -80,9 +89,26 @@ def test_agent_runs_parallel_tool_list_and_records_batch_trace(tmp_path):
     assert len({item["parallel_group_id"] for item in tool_items}) == 1
     assert {item["execution_mode"] for item in tool_items} == {"parallel"}
     assert any(item["role"] == "assistant" and item["content"] == "Reading both files." for item in agent.session["history"])
+    tool_request = next(item for item in agent.session["history"] if item.get("kind") == "tool_request")
+    assert [call["id"] for call in tool_request["tool_calls"]] == ["a", "b"]
+    assert [call["name"] for call in tool_request["tool_calls"]] == ["read_file", "read_file"]
 
     run_dir = next((tmp_path / ".pico" / "runs").iterdir())
     trace_events = [json.loads(line) for line in (run_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    request_events = [event for event in trace_events if event["event"] == "assistant_tool_request"]
+    assert request_events
+    assert request_events[0]["tool_calls"] == [
+        {
+            "id": "a",
+            "name": "read_file",
+            "args": {"path": "a.txt"},
+        },
+        {
+            "id": "b",
+            "name": "read_file",
+            "args": {"path": "b.txt"},
+        },
+    ]
     tool_events = [event for event in trace_events if event["event"] == "tool_executed"]
     assert [event["model_tool_call_id"] for event in tool_events] == ["a", "b"]
     assert [event["tool_call_id"] for event in tool_events] == [

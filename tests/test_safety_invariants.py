@@ -51,7 +51,14 @@ def test_risky_tool_deny_behavior(tmp_path):
 
     result = agent.run_tool("run_shell", {"command": "echo hi", "timeout": 20})
 
-    assert result == "error: approval denied for run_shell"
+    assert result.startswith("error: approval denied for run_shell")
+    assert "user rejected this risky tool request" in result
+    process_notes = [
+        note
+        for note in agent.memory.to_dict()["episodic_notes"]
+        if note.get("kind") == "process"
+    ]
+    assert process_notes == []
 
 
 def test_cli_build_agent_wires_secret_env_names_from_parser(tmp_path):

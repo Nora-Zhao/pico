@@ -391,6 +391,7 @@ class Pico:
             - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
+            - If a risky tool is rejected because approval was denied, do not retry the same risky action with a different path or variant. Return a final answer with the current state unless the user explicitly asks to continue.
             - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
 
             Tools:
@@ -731,7 +732,10 @@ class Pico:
             text = f"{name} error on {path_text}; check the failure before retry"
         else:
             text = f"{name} rejected; choose a different action before retry"
+        tool_error_code = str(metadata.get("tool_error_code", "")).strip()
         tags = ["process", status, *affected_paths]
+        if tool_error_code:
+            tags.append(tool_error_code)
         self.memory.append_note(text, tags=tuple(tags), source=name, kind="process")
         self.session["memory"] = self.memory.to_dict()
 
@@ -810,6 +814,42 @@ class Pico:
             },
         )
         return stage
+
+    def record_assistant_tool_request(self, task_state, calls):
+        normalized_calls = []
+        summary_parts = []
+        for index, call in enumerate(calls, start=1):
+            model_call_id = str(call.get("id") or call.get("model_tool_call_id") or f"tool-{index}").strip()
+            name = str(call.get("name", "")).strip()
+            args = dict(call.get("args", {}) or {})
+            normalized_calls.append(
+                {
+                    "id": model_call_id,
+                    "name": name,
+                    "args": args,
+                }
+            )
+            label = f"{model_call_id}:" if model_call_id else ""
+            summary_parts.append(f"{label}{name} {json.dumps(args, sort_keys=True, ensure_ascii=False)}")
+        content = "Requested tool call(s): " + "; ".join(summary_parts)
+        self.record(
+            {
+                "role": "assistant",
+                "kind": "tool_request",
+                "content": content,
+                "tool_calls": normalized_calls,
+                "created_at": now(),
+            }
+        )
+        self.emit_trace(
+            task_state,
+            "assistant_tool_request",
+            {
+                "tool_count": len(normalized_calls),
+                "tool_calls": normalized_calls,
+            },
+        )
+        return normalized_calls
 
     def ask(self, user_message):
         """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
@@ -971,6 +1011,7 @@ class Pico:
 
             if kind in {"tool", "tool_list"}:
                 calls = parsed_tools
+                self.record_assistant_tool_request(task_state, calls)
                 batch_problem = self.validate_tool_batch(calls, self.max_steps - tool_steps)
                 if batch_problem:
                     self.record({"role": "assistant", "content": self.retry_notice(batch_problem), "created_at": now()})
@@ -1182,7 +1223,7 @@ class Pico:
                 "workspace_changed": False,
                 "diff_summary": [],
             }
-            return f"error: approval denied for {name}", metadata
+            return f"error: approval denied for {name}; user rejected this risky tool request. Do not retry it unless the user asks to continue.", metadata
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
